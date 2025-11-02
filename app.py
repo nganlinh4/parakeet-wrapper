@@ -6,6 +6,7 @@ import numpy as np
 import os
 import csv
 import datetime
+import re
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -82,6 +83,74 @@ def generate_srt_content(segment_timestamps: list) -> str:
         srt_content.append("")
     return "\n".join(srt_content)
 
+def process_timestamped_result(timestamped_result):
+    """
+    Process TimestampedResult to create subtitle segments with real word timings.
+
+    Args:
+        timestamped_result: TimestampedResult object with timestamps and tokens
+
+    Returns:
+        List of dicts with 'start', 'end', 'segment' keys
+    """
+    timestamps = timestamped_result.timestamps
+    tokens = timestamped_result.tokens
+
+    if len(timestamps) != len(tokens):
+        print(f"Warning: Timestamps ({len(timestamps)}) and tokens ({len(tokens)}) length mismatch")
+        return []
+
+    # Group tokens into subtitle segments (aim for 30-50 characters per segment)
+    segments = []
+    current_segment_tokens = []
+    current_segment_start = None
+    current_char_count = 0
+    max_chars_per_segment = 50
+
+    for i, (timestamp, token) in enumerate(zip(timestamps, tokens)):
+        # Clean token (remove leading/trailing spaces that might be artifacts)
+        clean_token = token.strip()
+        if not clean_token:
+            continue
+
+        token_length = len(clean_token)
+
+        # Start new segment if this would exceed character limit
+        if current_segment_tokens and current_char_count + token_length > max_chars_per_segment:
+            # Create segment from current tokens
+            segment_text = ''.join(current_segment_tokens).strip()
+            if segment_text:
+                segment_end = timestamps[i-1] if i > 0 else timestamps[0]
+                segments.append({
+                    'start': current_segment_start,
+                    'end': segment_end,
+                    'segment': segment_text
+                })
+
+            # Start new segment
+            current_segment_tokens = [token]
+            current_segment_start = timestamp
+            current_char_count = token_length
+        else:
+            # Add to current segment
+            if not current_segment_tokens:
+                current_segment_start = timestamp
+            current_segment_tokens.append(token)
+            current_char_count += token_length
+
+    # Add final segment
+    if current_segment_tokens:
+        segment_text = ''.join(current_segment_tokens).strip()
+        if segment_text:
+            segments.append({
+                'start': current_segment_start,
+                'end': timestamps[-1],
+                'segment': segment_text
+            })
+
+    return segments
+
+
 def transcribe_audio(audio_path: str) -> dict:
     """Transcribe audio file and return results as JSON."""
     if not audio_path or not Path(audio_path).exists():
@@ -137,9 +206,13 @@ def transcribe_audio(audio_path: str) -> dict:
         try:
             print(f"Transcribing {info_path_name}...")
 
-            result = model.recognize(transcribe_path)
-            transcription = result
-            segment_timestamps = [{'start': 0.0, 'end': duration_sec, 'segment': transcription}]
+            # Use word-level timestamps for accurate subtitle timing
+            timestamp_model = model.with_timestamps()
+            result = timestamp_model.recognize(transcribe_path)
+            transcription = result.text
+
+            # Process timestamped result into subtitle segments
+            segment_timestamps = process_timestamped_result(result)
 
             # Generate CSV content
             csv_content = []
@@ -206,4 +279,4 @@ async def root():
 
 if __name__ == "__main__":
     print("Starting FastAPI server...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)

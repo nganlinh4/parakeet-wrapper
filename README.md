@@ -7,7 +7,8 @@ A Windows-compatible speech transcription API using NVIDIA's Parakeet TDT 0.6B V
 - **Multilingual Transcription**: Supports 25 European languages (bg, hr, cs, da, nl, en, et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, es, sv, ru, uk)
 - **GPU Acceleration**: Uses DirectML for GPU inference on Windows (no CUDA required)
 - **Automatic Punctuation and Capitalization**: Produces clean, readable transcripts
-- **Word-level Timestamps**: Provides accurate timestamps for transcribed segments
+- **Subtitle Segmentation**: Automatically splits transcription into subtitle-sized segments (3-4 seconds each)
+- **Word-level Timestamps**: Provides accurate timestamps for each subtitle segment
 - **Long Audio Support**: Handles audio up to 24 minutes
 - **REST API**: FastAPI-based REST API for programmatic access
 
@@ -69,16 +70,22 @@ Response format:
   "segments": [
     {
       "start": 0.0,
-      "end": 10.5,
-      "segment": "Transcribed text segment"
+      "end": 3.7,
+      "segment": "First subtitle segment"
+    },
+    {
+      "start": 3.7,
+      "end": 7.4,
+      "segment": "Second subtitle segment"
     }
   ],
   "csv_data": [
     ["Start (s)", "End (s)", "Segment"],
-    ["0.00", "10.50", "Transcribed text segment"]
+    ["0.00", "3.70", "First subtitle segment"],
+    ["3.70", "7.40", "Second subtitle segment"]
   ],
-  "srt_content": "1\n00:00:00,000 --> 00:00:10,500\nTranscribed text segment\n\n",
-  "duration": 10.5
+  "srt_content": "1\n00:00:00,000 --> 00:00:03,700\nFirst subtitle segment\n\n2\n00:00:03,700 --> 00:00:07,400\nSecond subtitle segment\n\n",
+  "duration": 103.8
 }
 ```
 
