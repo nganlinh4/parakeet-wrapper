@@ -1,15 +1,15 @@
-# Parakeet TDT 0.6B V3 Speech Transcription App
+# Parakeet TDT 0.6B V3 Speech Transcription API
 
-A Windows-compatible speech transcription application using NVIDIA's Parakeet TDT 0.6B V3 model, powered by onnx-asr for GPU-accelerated inference via DirectML.
+A Windows-compatible speech transcription API using NVIDIA's Parakeet TDT 0.6B V3 model, powered by onnx-asr for GPU-accelerated inference via DirectML.
 
 ## Features
 
 - **Multilingual Transcription**: Supports 25 European languages (bg, hr, cs, da, nl, en, et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, es, sv, ru, uk)
 - **GPU Acceleration**: Uses DirectML for GPU inference on Windows (no CUDA required)
 - **Automatic Punctuation and Capitalization**: Produces clean, readable transcripts
-- **Word-level Timestamps**: Click segments in the table to play corresponding audio
+- **Word-level Timestamps**: Provides accurate timestamps for transcribed segments
 - **Long Audio Support**: Handles audio up to 24 minutes
-- **Web Interface**: Gradio-based UI for easy file upload and transcription
+- **REST API**: FastAPI-based REST API for programmatic access
 
 ## Requirements
 
@@ -39,12 +39,48 @@ uv run --python .venv python -c "import urllib.request; urllib.request.urlretrie
 
 ## Usage
 
-Run the application:
+Run the API server:
 ```bash
 uv run python app.py
 ```
 
-Open your browser to `http://localhost:7860` and upload audio files for transcription.
+The API will be available at `http://localhost:8000`.
+
+### API Endpoints
+
+- `GET /`: Health check endpoint
+- `POST /transcribe`: Transcribe an audio file
+
+### Transcribe Audio
+
+Upload an audio file via POST request to `/transcribe`:
+
+```bash
+curl -X POST "http://localhost:8000/transcribe" \
+     -H "accept: application/json" \
+     -H "Content-Type: multipart/form-data" \
+     -F "file=@your_audio_file.mp3"
+```
+
+Response format:
+```json
+{
+  "transcription": "Full text transcription",
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 10.5,
+      "segment": "Transcribed text segment"
+    }
+  ],
+  "csv_data": [
+    ["Start (s)", "End (s)", "Segment"],
+    ["0.00", "10.50", "Transcribed text segment"]
+  ],
+  "srt_content": "1\n00:00:00,000 --> 00:00:10,500\nTranscribed text segment\n\n",
+  "duration": 10.5
+}
+```
 
 ## Supported Audio Formats
 
