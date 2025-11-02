@@ -1,0 +1,7 @@
+onnx-asr
+onnxruntime-directml
+gradio
+spaces
+pydub
+numpy
+scipy
