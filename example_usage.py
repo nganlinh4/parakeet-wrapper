@@ -80,7 +80,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-s", "--strategy",
         choices=['char', 'sentence'],
-        default='char',
+        default='sentence',
         help="The segmentation strategy to use. 'char' is word-safe character-limited. 'sentence' splits by sentence."
     )
     parser.add_argument(
