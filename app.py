@@ -4,6 +4,7 @@ import logging
 import datetime
 import tempfile
 import shutil
+import math
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -13,6 +14,9 @@ from onnx_asr import load_model
 from pydub import AudioSegment
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Literal, List
 
 # --- Configuration and Logging Setup ---
 
@@ -53,10 +57,18 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# --- CORS ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
 # --- Helper Functions ---
 
 def format_srt_time(seconds: float) -> str:
-    """Converts seconds to SRT time format HH:MM:SS,mmm."""
     if seconds < 0: seconds = 0.0
     delta = datetime.timedelta(seconds=seconds)
     hours, remainder = divmod(int(delta.total_seconds()), 3600)
@@ -65,7 +77,6 @@ def format_srt_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
 
 def generate_srt_content(segment_timestamps: list) -> str:
-    """Generates an SRT formatted string from segment data."""
     srt_content = []
     for i, ts in enumerate(segment_timestamps):
         start_time = format_srt_time(ts['start'])
@@ -78,164 +89,175 @@ def generate_srt_content(segment_timestamps: list) -> str:
     return "\n".join(srt_content)
 
 def _group_tokens_into_words(tokens: list, timestamps: list) -> list:
-    """
-    Stage 1: Groups subword tokens into whole words with their start times.
-    Most tokenizers prefix tokens that start a new word with a space-like character.
-    """
     words = []
     current_word_tokens = []
     current_word_start_time = None
-
-    if not tokens:
-        return []
-        
+    if not tokens: return []
     for i, token in enumerate(tokens):
         if current_word_start_time is None:
             current_word_start_time = timestamps[i]
-
-        # Heuristic: if a token starts with a space, it's a new word.
         if token.startswith(" "):
-            # Finalize the previous word
             if current_word_tokens:
                 word_text = "".join(current_word_tokens).strip()
                 words.append({"text": word_text, "start": current_word_start_time})
-            
-            # Start a new word
             current_word_tokens = [token]
             current_word_start_time = timestamps[i]
         else:
-            # Continue the current word
             current_word_tokens.append(token)
-    
-    # Add the very last word
     if current_word_tokens:
         word_text = "".join(current_word_tokens).strip()
         words.append({"text": word_text, "start": current_word_start_time})
-        
     return words
 
+def _split_sentence_evenly(sentence_words: List[dict], max_words: int) -> List[dict]:
+    """
+    Splits a list of words into evenly balanced segments.
+    If max_words is -1, the sentence is preserved as a single segment.
+    """
+    total_words = len(sentence_words)
+    if not sentence_words:
+        return []
 
-def process_timestamped_result(timestamped_result, audio_duration_sec: float, strategy: str = 'char', max_chars: int = 60) -> list:
-    """
-    Stage 2: Groups words into subtitle segments based on the chosen strategy.
-    This function now operates on whole words, preventing any splits.
-    """
+    # --- MODIFIED LOGIC ---
+    # Condition to return a single, unsplit segment:
+    # 1. The user explicitly requested to preserve sentences (-1).
+    # 2. The sentence is already at or below the desired max word count.
+    if max_words == -1 or total_words <= max_words:
+        return [{
+            'start': sentence_words[0]['start'],
+            'end': sentence_words[-1]['end'],
+            'segment': " ".join(w['text'] for w in sentence_words)
+        }]
+
+    # Distribute words as evenly as possible across multiple lines
+    num_lines = math.ceil(total_words / max_words)
+    base_words_per_line = total_words // num_lines
+    extra_words = total_words % num_lines
+    
+    segments = []
+    current_word_index = 0
+    for i in range(num_lines):
+        words_in_this_line = base_words_per_line + (1 if i < extra_words else 0)
+        chunk = sentence_words[current_word_index : current_word_index + words_in_this_line]
+        if not chunk: continue
+        
+        segments.append({
+            'start': chunk[0]['start'],
+            'end': chunk[-1]['end'],
+            'segment': " ".join(w['text'] for w in chunk)
+        })
+        current_word_index += words_in_this_line
+        
+    return segments
+
+def process_timestamped_result(timestamped_result, audio_duration_sec: float, segment_strategy: str, max_chars: int, max_words: int, pause_threshold: float) -> list:
+    AVG_CHAR_DURATION = 0.07
+
     timestamps = timestamped_result.timestamps
     tokens = timestamped_result.tokens
+    if not timestamps or not tokens: return []
 
-    if not timestamps or not tokens:
-        return []
-
-    # Stage 1: Group tokens into words
     words = _group_tokens_into_words(tokens, timestamps)
-    if not words:
-        return []
-
-    # Stage 2: Group words into segments
-    segments = []
-    current_segment_words = []
-    current_segment_start = words[0]['start']
+    if not words: return []
 
     for i, word in enumerate(words):
-        current_segment_words.append(word['text'])
-        text = " ".join(current_segment_words)
-        
-        end_segment = False
         is_last_word = (i == len(words) - 1)
-
-        if strategy == 'char':
-            # Look ahead to see if the next word would push it over the limit
-            next_word_len = len(words[i+1]['text']) if not is_last_word else 0
-            if (len(text) + next_word_len + 1 > max_chars) or is_last_word:
-                end_segment = True
-        elif strategy == 'sentence':
-            if word['text'].strip().endswith(('.', '?', '!')) or is_last_word:
-                end_segment = True
+        estimated_speech_duration = len(word['text']) * AVG_CHAR_DURATION
+        estimated_end_time = word['start'] + estimated_speech_duration
         
-        if end_segment:
-            segment_end = words[i+1]['start'] if not is_last_word else audio_duration_sec
-            segments.append({
-                'start': current_segment_start,
-                'end': segment_end,
-                'segment': text
-            })
+        if not is_last_word:
+            word['end'] = min(estimated_end_time, words[i+1]['start'])
+        else:
+            word['end'] = min(estimated_end_time, audio_duration_sec)
+
+    all_segments = []
+    
+    if segment_strategy == 'sentence':
+        sentence_buffer = []
+        for i, word in enumerate(words):
+            sentence_buffer.append(word)
+            is_last_word_of_all = (i == len(words) - 1)
             
-            if not is_last_word:
-                current_segment_start = words[i+1]['start']
+            pause_after_word = (words[i+1]['start'] - word['end']) if not is_last_word_of_all else 0
+            
+            is_sentence_end = (
+                is_last_word_of_all or
+                pause_after_word >= pause_threshold or
+                word['text'].strip().endswith(('.', '?', '!'))
+            )
+            
+            if is_sentence_end and sentence_buffer:
+                evenly_split_segments = _split_sentence_evenly(sentence_buffer, max_words)
+                all_segments.extend(evenly_split_segments)
+                sentence_buffer = []
+    else:
+        current_segment_words = []
+        for i, word in enumerate(words):
+            current_segment_words.append(word)
+            current_text = " ".join(w['text'] for w in current_segment_words)
+            is_last_word_of_all = (i == len(words) - 1)
+            
+            pause_after_word = (words[i+1]['start'] - word['end']) if not is_last_word_of_all else 0
+
+            end_segment = False
+            if is_last_word_of_all:
+                end_segment = True
+            elif pause_after_word >= pause_threshold:
+                end_segment = True
+            elif segment_strategy == 'word' and len(current_segment_words) >= max_words and max_words != -1:
+                end_segment = True
+            elif segment_strategy == 'char' and len(current_text) + (len(words[i+1]['text']) + 1 if not is_last_word_of_all else 0) > max_chars:
+                end_segment = True
+
+            if end_segment and current_segment_words:
+                all_segments.append({
+                    'start': current_segment_words[0]['start'],
+                    'end': current_segment_words[-1]['end'],
+                    'segment': " ".join(w['text'] for w in current_segment_words)
+                })
                 current_segment_words = []
-                
-    return segments
+
+    return all_segments
 
 # --- Core Transcription Logic ---
 
-def transcribe_audio(audio_path: str, model, strategy: str, max_chars: int) -> dict:
-    # (This function remains unchanged from the previous version)
+def transcribe_audio(audio_path: str, model, segment_strategy: str, max_chars: int, max_words: int, pause_threshold: float) -> dict:
     if not model:
         raise HTTPException(status_code=503, detail="ASR model is not available.")
     
-    original_path = Path(audio_path)
-    if not original_path.exists():
-        raise HTTPException(status_code=404, detail=f"Audio file not found at path: {audio_path}")
-
-    processed_audio_path = None
     try:
-        logger.info(f"Loading audio file: {original_path.name}")
         audio = AudioSegment.from_file(audio_path)
         duration_sec = audio.duration_seconds
     except Exception as e:
-        logger.error(f"Failed to load audio file {original_path.name}: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=f"Could not process audio file: {e}")
 
     target_sr = 16000
-    needs_processing = (audio.frame_rate != target_sr) or (audio.channels != 1)
+    transcribe_path = audio_path
+    processed_audio_path = None
     
-    if audio.channels > 2:
-        raise HTTPException(status_code=400, detail=f"Audio has {audio.channels} channels. Only mono or stereo supported.")
-    
-    if needs_processing:
-        logger.info("Audio requires pre-processing (resampling/mono conversion).")
+    if (audio.frame_rate != target_sr) or (audio.channels != 1):
         if audio.frame_rate != target_sr: audio = audio.set_frame_rate(target_sr)
         if audio.channels != 1: audio = audio.set_channels(1)
-        
         with tempfile.NamedTemporaryFile(suffix='_processed.wav', delete=False) as temp_f:
             processed_audio_path = Path(temp_f.name)
         audio.export(processed_audio_path, format="wav")
         transcribe_path = str(processed_audio_path)
-    else:
-        transcribe_path = audio_path
 
     try:
-        logger.info(f"Transcribing {Path(transcribe_path).name} ({duration_sec:.2f} seconds)...")
         result = model.recognize(transcribe_path)
-        
-        full_transcription = result.text
-        segment_timestamps = process_timestamped_result(result, duration_sec, strategy, max_chars)
-
-        csv_content = [["Start (s)", "End (s)", "Segment"]] + [
-            [f"{ts['start']:.2f}", f"{ts['end']:.2f}", ts['segment']] for ts in segment_timestamps
-        ]
+        segment_timestamps = process_timestamped_result(result, duration_sec, segment_strategy, max_chars, max_words, pause_threshold)
         srt_content = generate_srt_content(segment_timestamps)
-
-        logger.info("Transcription complete.")
         return {
-            "transcription": full_transcription,
+            "transcription": result.text,
             "segments": segment_timestamps,
-            "csv_data": csv_content,
             "srt_content": srt_content,
             "duration_seconds": duration_sec
         }
-    except Exception as e:
-        logger.error(f"Transcription failed for {Path(transcribe_path).name}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An error occurred during transcription: {e}")
     finally:
         if processed_audio_path and processed_audio_path.exists():
-            try:
-                processed_audio_path.unlink()
-            except Exception as e:
-                logger.error(f"Error removing temporary file {processed_audio_path}: {e}")
+            processed_audio_path.unlink()
 
 # --- API Endpoints ---
-# (These functions also remain unchanged from the previous version)
 
 @app.get("/")
 async def root():
@@ -244,35 +266,72 @@ async def root():
 @app.post("/transcribe")
 async def transcribe_endpoint(
     file: UploadFile = File(...),
-    segment_strategy: str = Form("char", enum=["char", "sentence"]),
-    max_chars: int = Form(60, gt=10, le=200)
+    segment_strategy: str = Form("sentence", enum=["char", "sentence", "word"]),
+    max_chars: int = Form(42, gt=10, le=200),
+    max_words: int = Form(7, ge=-1, le=50), # MODIFIED: Allows -1
+    pause_threshold: float = Form(0.8, gt=0.1, le=5.0)
 ):
     """
     Accepts an audio file and transcription parameters.
-    - **segment_strategy**: 'char' for word-safe character limit, 'sentence' for sentence-based splits.
-    - **max_chars**: Maximum characters per segment (used with 'char' strategy). Must be between 10 and 200.
+
+    - **segment_strategy**:
+      - `sentence`: Breaks on pauses/punctuation, then evenly splits long sentences by `max_words`.
+      - `word`: Breaks on pauses or when `max_words` is reached.
+      - `char`: Breaks on pauses or when `max_chars` is reached.
+    - **max_chars**: Character limit for the 'char' strategy.
+    - **max_words**: Word limit for 'sentence' and 'word' strategies. Use -1 to preserve full sentences.
+    - **pause_threshold**: Seconds of silence to trigger a new segment.
     """
+    if max_words == 0:
+        raise HTTPException(status_code=400, detail="max_words cannot be 0.")
     if not file.content_type.startswith("audio/"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid file type: '{file.content_type}'. Please upload an audio file."
-        )
+        raise HTTPException(status_code=400, detail=f"Invalid file type: '{file.content_type}'.")
 
     temp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as temp_file:
+        suffix = Path(file.filename).suffix
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
             shutil.copyfileobj(file.file, temp_file)
             temp_path = temp_file.name
         
         asr_model = app_state.get("asr_model")
-        result = transcribe_audio(temp_path, asr_model, segment_strategy, max_chars)
+        result = transcribe_audio(temp_path, asr_model, segment_strategy, max_chars, max_words, pause_threshold)
         return JSONResponse(content=result)
-    
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as e:
-        logger.error(f"An unexpected error occurred in the transcribe endpoint: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal server error occurred.")
+    finally:
+        if temp_path and Path(temp_path).exists():
+            Path(temp_path).unlink()
+
+class TranscribeBase64Request(BaseModel):
+    audio_base64: str
+    filename: Optional[str] = "audio.wav"
+    segment_strategy: Literal['char', 'sentence', 'word'] = 'sentence'
+    max_chars: int = 42
+    max_words: int = 7 # Can be -1 to preserve sentences
+    pause_threshold: float = 0.8
+
+@app.post("/transcribe_base64")
+async def transcribe_base64_endpoint(payload: TranscribeBase64Request):
+    import base64
+    if payload.max_words == 0:
+        raise HTTPException(status_code=400, detail="max_words cannot be 0.")
+        
+    temp_path = None
+    try:
+        audio_b64 = payload.audio_base64
+        if "," in audio_b64 and audio_b64.strip().startswith("data:"):
+            audio_b64 = audio_b64.split(",", 1)[1]
+        
+        suffix = ''.join(Path(payload.filename).suffixes)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+            temp_path = Path(f.name)
+            f.write(base64.b64decode(audio_b64))
+
+        asr_model = app_state.get("asr_model")
+        result = transcribe_audio(
+            str(temp_path), asr_model, payload.segment_strategy,
+            payload.max_chars, payload.max_words, payload.pause_threshold
+        )
+        return JSONResponse(content=result)
     finally:
         if temp_path and Path(temp_path).exists():
             Path(temp_path).unlink()

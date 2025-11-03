@@ -5,9 +5,9 @@ import sys
 
 # --- Configuration ---
 API_URL = "http://localhost:8001/transcribe"
-DEFAULT_AUDIO_PATH = "data/example-yt_saTD1u8PorI.mp3"
+DEFAULT_AUDIO_PATH = "data/audio.mp3"
 
-def transcribe_audio_file(audio_file_path: str, strategy: str, max_chars: int):
+def transcribe_audio_file(audio_file_path: str, strategy: str, max_value: int):
     """
     Sends an audio file to the transcription API with segmentation parameters.
     """
@@ -18,7 +18,8 @@ def transcribe_audio_file(audio_file_path: str, strategy: str, max_chars: int):
     file_name = os.path.basename(audio_file_path)
     output_srt_path = f"{os.path.splitext(file_name)[0]}_{strategy}.srt"
 
-    print(f"🚀 Sending '{file_name}' to the API with strategy='{strategy}' and max_chars={max_chars}...")
+    param_name = 'max_chars' if strategy == 'char' else 'max_words'
+    print(f"🚀 Sending '{file_name}' to the API with strategy='{strategy}' and {param_name}={max_value}...")
     print("   (This may take a moment for large files)")
 
     try:
@@ -26,7 +27,7 @@ def transcribe_audio_file(audio_file_path: str, strategy: str, max_chars: int):
             # We send parameters as a 'data' payload alongside the 'files'
             form_data = {
                 'segment_strategy': strategy,
-                'max_chars': str(max_chars) # Form data should be strings
+                param_name: str(max_value) # Form data should be strings
             }
             files = {'file': (file_name, f, 'audio/mpeg')}
             
@@ -79,16 +80,16 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-s", "--strategy",
-        choices=['char', 'sentence'],
+        choices=['char', 'sentence', 'word'],
         default='sentence',
-        help="The segmentation strategy to use. 'char' is word-safe character-limited. 'sentence' splits by sentence."
+        help="The segmentation strategy to use. 'char' breaks on pauses or max_chars. 'sentence' breaks on pauses/punctuation then splits by max_words. 'word' breaks on pauses or max_words."
     )
     parser.add_argument(
-        "-c", "--max_chars",
+        "-m", "--max_value",
         type=int,
-        default=60,
-        help="The maximum characters per segment for the 'char' strategy."
+        default=-1,
+        help="The maximum value per segment: max_chars for 'char' strategy, max_words for 'sentence'/'word' (use -1 to preserve full sentences)."
     )
     args = parser.parse_args()
-    
-    transcribe_audio_file(args.audio_file, args.strategy, args.max_chars)
+
+    transcribe_audio_file(args.audio_file, args.strategy, args.max_value)
